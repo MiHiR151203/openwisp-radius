@@ -1,15 +1,18 @@
-from django.contrib.auth import get_user_model
+import uuid
+
+from django.core.cache import cache
+from django.core.validators import RegexValidator, _lazy_re_compile
 from django.db import models
-from django.db.models import signals
+from django.utils.crypto import get_random_string
+from django.utils.translation import ugettext_lazy as _
 from django_freeradius.base.models import (AbstractNas, AbstractRadiusAccounting, AbstractRadiusBatch,
-                                           AbstractRadiusCheck, AbstractRadiusGroupCheck,
+                                           AbstractRadiusCheck, AbstractRadiusGroup, AbstractRadiusGroupCheck,
                                            AbstractRadiusGroupReply, AbstractRadiusPostAuth,
-                                           AbstractRadiusProfile, AbstractRadiusReply,
-                                           AbstractRadiusUserGroup, AbstractRadiusUserProfile)
-from django_freeradius.utils import set_default_limits
+                                           AbstractRadiusReply, AbstractRadiusUserGroup)
 from swapper import swappable_setting
 
 from openwisp_users.mixins import OrgMixin
+from openwisp_users.models import OrganizationUser
 
 
 class RadiusCheck(OrgMixin, AbstractRadiusCheck):
@@ -18,28 +21,52 @@ class RadiusCheck(OrgMixin, AbstractRadiusCheck):
         swappable = swappable_setting('openwisp_radius', 'RadiusCheck')
 
 
-class RadiusAccounting(OrgMixin, AbstractRadiusAccounting):
-    class Meta(AbstractRadiusAccounting.Meta):
-        abstract = False
-        swappable = swappable_setting('openwisp_radius', 'RadiusAccounting')
-
-
 class RadiusReply(OrgMixin, AbstractRadiusReply):
     class Meta(AbstractRadiusReply.Meta):
         abstract = False
         swappable = swappable_setting('openwisp_radius', 'RadiusReply')
 
 
-class RadiusGroupCheck(OrgMixin, AbstractRadiusGroupCheck):
+class RadiusAccounting(OrgMixin, AbstractRadiusAccounting):
+    class Meta(AbstractRadiusAccounting.Meta):
+        abstract = False
+        swappable = swappable_setting('openwisp_radius', 'RadiusAccounting')
+
+
+class RadiusGroup(OrgMixin, AbstractRadiusGroup):
+    def get_default_queryset(self):
+        return super().get_default_queryset() \
+                      .filter(organization_id=self.organization.pk)
+
+    def clean(self):
+        super().clean()
+        if not hasattr(self, 'organization'):
+            return
+        if not self.name.startswith('{}-'.format(self.organization.slug)):
+            self.name = '{}-{}'.format(self.organization.slug,
+                                       self.name)
+
+    class Meta(AbstractRadiusGroup.Meta):
+        abstract = False
+        swappable = swappable_setting('openwisp_radius', 'RadiusGroup')
+
+
+class RadiusGroupCheck(AbstractRadiusGroupCheck):
     class Meta(AbstractRadiusGroupCheck.Meta):
         abstract = False
         swappable = swappable_setting('openwisp_radius', 'RadiusGroupCheck')
 
 
-class RadiusGroupReply(OrgMixin, AbstractRadiusGroupReply):
+class RadiusGroupReply(AbstractRadiusGroupReply):
     class Meta(AbstractRadiusGroupReply.Meta):
         abstract = False
         swappable = swappable_setting('openwisp_radius', 'RadiusGroupReply')
+
+
+class RadiusUserGroup(AbstractRadiusUserGroup):
+    class Meta(AbstractRadiusUserGroup.Meta):
+        abstract = False
+        swappable = swappable_setting('openwisp_radius', 'RadiusUserGroup')
 
 
 class RadiusPostAuth(OrgMixin, AbstractRadiusPostAuth):
@@ -48,44 +75,69 @@ class RadiusPostAuth(OrgMixin, AbstractRadiusPostAuth):
         swappable = swappable_setting('openwisp_radius', 'RadiusPostAuth')
 
 
-class RadiusUserGroup(OrgMixin, AbstractRadiusUserGroup):
-    class Meta(AbstractRadiusUserGroup.Meta):
-        abstract = False
-        swappable = swappable_setting('openwisp_radius', 'RadiusUserGroup')
-
-
 class Nas(OrgMixin, AbstractNas):
     class Meta(AbstractNas.Meta):
         abstract = False
         swappable = swappable_setting('openwisp_radius', 'Nas')
 
 
+batch_name = AbstractRadiusBatch._meta.get_field('name')
+
+
 class RadiusBatch(OrgMixin, AbstractRadiusBatch):
+    name = models.CharField(batch_name.verbose_name,
+                            max_length=batch_name.max_length,
+                            help_text=batch_name.help_text,
+                            db_index=batch_name.db_index,
+                            unique=False)
+
+    def save_user(self, user):
+        super().save_user(user)
+        obj = OrganizationUser(user=user, organization=self.organization, is_admin=False)
+        obj.full_clean()
+        obj.save()
+
     class Meta(AbstractRadiusBatch.Meta):
         abstract = False
+        unique_together = ('name', 'organization')
         swappable = swappable_setting('openwisp_radius', 'RadiusBatch')
 
 
-class RadiusProfile(OrgMixin, AbstractRadiusProfile):
-    def _create_user_profile(self, **kwargs):
-        options = dict(organization=self.organization)
-        options.update(kwargs)
-        return super(RadiusProfile, self)._create_user_profile(**options)
-
-    class Meta(AbstractRadiusProfile.Meta):
-        abstract = False
-        swappable = swappable_setting('openwisp_radius', 'RadiusProfile')
+key_validator = RegexValidator(
+    _lazy_re_compile('^[^\s/\.]+$'),
+    message=_('Key must not contain spaces, dots or slashes.'),
+    code='invalid',
+)
 
 
-class RadiusUserProfile(OrgMixin, AbstractRadiusUserProfile):
-    def _get_instance(self, **kwargs):
-        options = dict(organization=self.organization)
-        options.update(kwargs)
-        return super(RadiusUserProfile, self)._get_instance(**options)
-
-    class Meta(AbstractRadiusUserProfile.Meta):
-        abstract = False
-        swappable = swappable_setting('openwisp_radius', 'RadiusUserProfile')
+def generate_token():
+    return get_random_string(length=32)
 
 
-signals.post_save.connect(set_default_limits, sender=get_user_model())
+class OrganizationRadiusSettings(models.Model):
+    id = models.UUIDField(default=uuid.uuid4,
+                          primary_key=True,
+                          editable=False)
+    organization = models.OneToOneField('openwisp_users.Organization',
+                                        verbose_name=_('organization'),
+                                        related_name='radius_settings',
+                                        on_delete=models.CASCADE)
+    token = models.CharField(max_length=32,
+                             validators=[key_validator],
+                             default=generate_token)
+
+    class Meta:
+        verbose_name = _('Organization radius settings')
+        verbose_name_plural = verbose_name
+
+    def __str__(self):
+        return self.organization.name
+
+    def save(self, *args, **kwargs):
+        super(OrganizationRadiusSettings, self).save(*args, **kwargs)
+        cache.set(self.pk, self.token)
+
+    def delete(self, *args, **kwargs):
+        pk = self.pk
+        super(OrganizationRadiusSettings, self).delete(*args, **kwargs)
+        cache.delete(pk)

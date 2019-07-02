@@ -1,4 +1,5 @@
 import sys
+
 from openwisp_users.models import Organization
 
 
@@ -14,8 +15,8 @@ class BatchAddMixin(object):
         try:
             org = Organization.objects.get(name=org_name)
         except Organization.DoesNotExist:
-            sys.stdout.write("Incorrect organization name provided\n")
+            sys.stdout.write("The organization supplied was not found\n")
             sys.exit(1)
         batch = super(BatchAddMixin, self)._create_batch(**options)
         batch.organization = org
-        return batch 
+        return batch
